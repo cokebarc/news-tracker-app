@@ -4,16 +4,19 @@
 Basit Haber Takip Uygulaması (Streamlit + SQLite + RSS)
 - Geniş preset liste
 - User-Agent ile sağlam RSS çekme (requests + feedparser)
+- Google News (anahtar kelimelerden RSS üret) ile geniş kapsama
+- (İsteğe bağlı) Google yönlendirme linkini gerçek habere çözme
 - Canlı ilerleme çubuğu ve anlık kaynak günlüğü
 - Per-feed rapor ve hata görünürlüğü
 - Anahtar kelime filtresi (son X dakika)
-- 5 dakikada bir otomatik yenileme (opsiyonel)
+- 5 dakikada bir otomatik yenileme (opsiyonel) + oto-çek kaynağı seçimi
 """
 import hashlib
 import sqlite3
 from datetime import datetime, timedelta, timezone
 import re
 from typing import List, Tuple
+from urllib.parse import quote_plus
 
 import pandas as pd
 import feedparser
@@ -134,7 +137,32 @@ PRESET_FEEDS = {
     "Yurt Gazetesi":"https://www.yurtgazetesi.com.tr/service/rss.php",
 }
 
-# ------------------ DB helpers ------------------
+# -------- Google News helper'ları --------
+def build_gnews_feeds(keywords: str, hl="tr", gl="TR", ceid="TR:tr", mode="each"):
+    terms = [k.strip() for k in (keywords or "").split(",") if k.strip()]
+    feeds = []
+    if not terms:
+        return feeds
+    if mode == "all":
+        q = " ".join(terms)
+        url = f"https://news.google.com/rss/search?q={quote_plus(q)}&hl={hl}&gl={gl}&ceid={ceid}"
+        feeds.append((f"GNews: {q}", url))
+    else:
+        for t in terms:
+            url = f"https://news.google.com/rss/search?q={quote_plus(t)}&hl={hl}&gl={gl}&ceid={ceid}"
+            feeds.append((f"GNews: {t}", url))
+    return feeds
+
+def resolve_final_url(url: str) -> str:
+    try:
+        if "news.google.com" in url:
+            r = requests.get(url, headers={"User-Agent": UA}, allow_redirects=True, timeout=10)
+            return r.url or url
+    except Exception:
+        pass
+    return url
+
+# -------- DB helpers --------
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("""CREATE TABLE IF NOT EXISTS feeds(
@@ -179,10 +207,9 @@ def insert_item(conn, item) -> int:
     cur = conn.execute(
         f"INSERT OR IGNORE INTO items({','.join(cols)}) VALUES({','.join(['?']*len(cols))})", vals
     )
-    return cur.rowcount  # 1: eklendi, 0: zaten vardı
+    return cur.rowcount
 
 def fetch_feed(url: str, timeout: int = 20):
-    """Request ile indir (UA + redirect), sonra feedparser.parse(content)."""
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": UA}, allow_redirects=True)
         r.raise_for_status()
@@ -192,11 +219,7 @@ def fetch_feed(url: str, timeout: int = 20):
     except Exception as e:
         return None, str(e)
 
-def pull_all_with_live_progress(conn, feeds_df, default_tag: str = "", timeout: int = 15):
-    """
-    Kaynakları tek tek çekerken canlı ilerleme ve log gösterir.
-    Dönüş: {"total_seen":int, "total_inserted":int, "per_feed":[...], "errors":[(...), ...]}
-    """
+def pull_all_with_live_progress(conn, feeds_df, default_tag: str = "", timeout: int = 15, resolve_links: bool = False):
     report = {"total_seen": 0, "total_inserted": 0, "per_feed": [], "errors": []}
     total = len(feeds_df)
     if total == 0:
@@ -239,6 +262,8 @@ def pull_all_with_live_progress(conn, feeds_df, default_tag: str = "", timeout: 
             seen += 1
             title = (e.get("title") or "").strip()
             link = (e.get("link") or "").strip()
+            if resolve_links and "news.google.com" in link:
+                link = resolve_final_url(link)
             summary = e.get("summary", "") or e.get("description", "") or ""
             if e.get("published_parsed"):
                 pubdt = datetime(*e.published_parsed[:6], tzinfo=timezone.utc).isoformat()
@@ -263,7 +288,11 @@ def pull_all_with_live_progress(conn, feeds_df, default_tag: str = "", timeout: 
 
         report["total_seen"] += seen
         report["total_inserted"] += inserted
-        report["per_feed"].append({"feed": title_feed, "url": url, "seen": seen, "inserted": inserted, "status": "OK" if seen else "EMPTY"})
+        report["per_feed"].append({
+            "feed": title_feed, "url": url,
+            "seen": seen, "inserted": inserted,
+            "status": "OK" if seen else "EMPTY"
+        })
         _write(f"✅ **{title_feed}**: {inserted} yeni / {seen} görüldü")
         progress.progress((i + 1) / total, text=f"{i+1}/{total} • {title_feed} bitti")
 
@@ -281,7 +310,7 @@ def pull_all_with_live_progress(conn, feeds_df, default_tag: str = "", timeout: 
                 st.code(str(msg))
     return report
 
-def query_items(conn, search="", tag="", only_unread=False, only_starred=False, date_from=None, date_to=None, limit=500):
+def query_items(conn, search="", tag="", only_unread=False, only_starred=False, date_from=None, date_to=None, limit=5000):
     sql = "SELECT * FROM items WHERE 1=1"
     params = []
     if search:
@@ -313,9 +342,25 @@ def export_csv(df, filename="news_export.csv"):
     df.to_csv(filename, index=False, encoding="utf-8-sig")
     return filename
 
+# -------- feed listelerini üretmeye yarayan yardımcılar --------
+def gnews_feeds_df_from_keywords(keywords: str, gnews_mode_label: str) -> pd.DataFrame:
+    mode = "each" if gnews_mode_label.startswith("Her") else "all"
+    extras = build_gnews_feeds(keywords, mode=mode)
+    if not extras:
+        return pd.DataFrame(columns=["title", "url", "tag"])
+    return pd.DataFrame([{"title": t, "url": u, "tag": "gnews"} for (t, u) in extras])
+
+def combined_feeds_df(conn, keywords: str, use_gnews: bool, gnews_mode_label: str):
+    base_df = list_feeds(conn)
+    if use_gnews:
+        df_extra = gnews_feeds_df_from_keywords(keywords, gnews_mode_label)
+        if not df_extra.empty:
+            base_df = pd.concat([base_df, df_extra], ignore_index=True) if not base_df.empty else df_extra
+    return base_df
+
 # ------------------ UI ------------------
 st.set_page_config(page_title="Haber Takip", page_icon="📰", layout="wide")
-st.title("📰 Haber Takip Uygulaması (RSS)")
+st.title("📰 Haber Takip Uygulaması (RSS + Google News)")
 
 conn = get_conn()
 
@@ -323,18 +368,27 @@ conn = get_conn()
 with st.sidebar:
     st.header("Ayarlar")
     tzinfo = timezone(timedelta(hours=3))  # Europe/Istanbul
+
     auto_refresh = st.checkbox("Otomatik yenile (5 dakikada bir)", value=False)
     if auto_refresh:
         st.markdown("<meta http-equiv='refresh' content='300'>", unsafe_allow_html=True)
-    auto_pull = st.checkbox("Oto-yenilemede RSS çek", value=False)
+    auto_pull = st.checkbox("Oto-çek (sayfa yenilenince çek)", value=False)
     st.markdown("---")
 
     st.subheader("Anahtar Kelime / Zaman Penceresi")
-    keywords = st.text_input("Virgülle ayırın",
-                             value="beyaz kod, sağlıkta şiddet, hastane, şehir hastanesi, devlet hastanesi, acil servis, MHRS")
-    time_window_min = st.number_input("Son X dakika içinde ara", min_value=5, max_value=10080, value=60, step=5)
+    keywords = st.text_input("Virgülle ayırın", value="beyaz kod, sağlıkta şiddet, hastane, şehir hastanesi, devlet hastanesi, acil servis, MHRS")
+    time_window_min = st.number_input("Son X dakika içinde ara", min_value=5, max_value=300000, value=60, step=5)
     st.caption("Eşleşme paneli, son X dakika içindeki haberlerden anahtar kelime eşleşmelerini çıkarır.")
     st.markdown("---")
+
+    st.subheader("Arama Kaynağı (Google News ayarları)")
+    use_gnews = st.checkbox("Birlikte çekimde Google News'i de ekle", value=True)
+    gnews_mode_label = st.radio("Google News sorgu modu", ["Her kelime ayrı", "Tümü birlikte (AND)"], horizontal=True, index=0)
+    resolve_links_opt = st.checkbox("Google yönlendirme linklerini gerçek habere çevir (yavaşlatabilir)", value=False)
+
+    st.markdown("---")
+    st.subheader("Oto-çek kaynağı")
+    auto_pull_source = st.radio("Oto-çek sırasında kullanılacak kaynak", ["Kayıtlı", "Google News", "Birlikte"], horizontal=True, index=2)
 
 # ---- Preset + Tekil + Toplu ekleme ----
 with st.sidebar:
@@ -392,8 +446,8 @@ with st.sidebar:
         st.rerun()
 
     st.subheader("Kayıtlı Kaynaklar")
-    feeds_df = list_feeds(conn)
-    st.dataframe(feeds_df, use_container_width=True, hide_index=True, height=260)
+    feeds_df_sidebar = list_feeds(conn)
+    st.dataframe(feeds_df_sidebar, use_container_width=True, hide_index=True, height=260)
 
     remove_url = st.text_input("Silinecek Kaynak URL")
     if st.button("🗑️ Kaynağı Sil"):
@@ -405,9 +459,16 @@ with st.sidebar:
             st.error("URL girin.")
 
 # Oto-yenilemede otomatik çekme
-if auto_refresh and auto_pull and not feeds_df.empty:
+if auto_refresh and auto_pull:
     try:
-        rep = pull_all_with_live_progress(conn, feeds_df)
+        if auto_pull_source == "Kayıtlı":
+            feeds_df_auto = list_feeds(conn)
+        elif auto_pull_source == "Google News":
+            feeds_df_auto = gnews_feeds_df_from_keywords(keywords, gnews_mode_label)
+        else:  # Birlikte
+            feeds_df_auto = combined_feeds_df(conn, keywords, use_gnews=True, gnews_mode_label=gnews_mode_label)
+
+        rep = pull_all_with_live_progress(conn, feeds_df_auto, timeout=15, resolve_links=resolve_links_opt)
         st.caption(f"🔄 Oto-çek: {rep['total_inserted']} yeni / {rep['total_seen']} görüldü.")
     except Exception as e:
         st.caption(f"⚠️ Oto-çek hata: {e}")
@@ -420,13 +481,34 @@ with left:
     st.subheader("Veri Çek")
     timeout_sec = st.slider("Feed başına zaman aşımı (sn)", min_value=5, max_value=30, value=15, step=1,
                             help="Bazı siteler yavaş; bekleme süresi.")
-    if st.button("🔄 Haberleri Çek (Tüm Kaynaklar)"):
-        feeds_df = list_feeds(conn)
-        if feeds_df.empty:
-            st.warning("Önce en az bir kaynak ekleyin.")
-        else:
-            rep = pull_all_with_live_progress(conn, feeds_df, timeout=timeout_sec)
-            st.success(f"Toplam: {rep['total_inserted']} yeni / {rep['total_seen']} görüldü.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("🗂️ Kayıtlı Kaynaklardan Çek"):
+            feeds_df_only_registered = list_feeds(conn)
+            if feeds_df_only_registered.empty:
+                st.warning("Kayıtlı kaynak yok.")
+            else:
+                rep = pull_all_with_live_progress(conn, feeds_df_only_registered, timeout=timeout_sec, resolve_links=resolve_links_opt)
+                st.success(f"Kayıtlı kaynaklar: {rep['total_inserted']} yeni / {rep['total_seen']} görüldü.")
+
+    with c2:
+        if st.button("🔎 Google News’ten Ara (Sadece)"):
+            feeds_df_only_gnews = gnews_feeds_df_from_keywords(keywords, gnews_mode_label)
+            if feeds_df_only_gnews.empty:
+                st.warning("Anahtar kelime girin (en az bir tane).")
+            else:
+                rep = pull_all_with_live_progress(conn, feeds_df_only_gnews, timeout=timeout_sec, resolve_links=resolve_links_opt)
+                st.success(f"Google News: {rep['total_inserted']} yeni / {rep['total_seen']} görüldü.")
+
+    with c3:
+        if st.button("🔄 Kayıtlı + Google News (Birlikte)"):
+            feeds_df_all = combined_feeds_df(conn, keywords, use_gnews=True, gnews_mode_label=gnews_mode_label)
+            if feeds_df_all.empty:
+                st.warning("Kaynak bulunamadı. Kayıtlı ekleyin veya anahtar kelime girin.")
+            else:
+                rep = pull_all_with_live_progress(conn, feeds_df_all, timeout=timeout_sec, resolve_links=resolve_links_opt)
+                st.success(f"Birlikte: {rep['total_inserted']} yeni / {rep['total_seen']} görüldü.")
 
     st.subheader("Filtreler")
     tag = st.text_input("Etiket")
@@ -462,8 +544,8 @@ with left:
     st.subheader("Dışa Aktar")
     if st.button("📤 Sonuçları CSV Olarak Kaydet"):
         q = st.session_state["last_query"]
-        df = query_items(conn, **q, limit=5000)
-        fname = export_csv(df, "news_export.csv")
+        df_to_export = query_items(conn, **q, limit=5000)
+        fname = export_csv(df_to_export, "news_export.csv")
         st.success(f"Kaydedildi: {fname}")
         with open(fname, "rb") as f:
             st.download_button("İndir (CSV)", f, file_name="news_export.csv")
@@ -478,7 +560,7 @@ with right:
     kw = [k.strip().lower() for k in (keywords or "").split(",") if k.strip()]
     st.markdown("#### 🔔 Son Eşleşmeler")
     if df.empty:
-        st.info("Henüz kayıt yok. Soldan kaynak ekleyip 'Haberleri Çek' butonuna basın.")
+        st.info("Henüz kayıt yok. Soldan bir çekim yapın.")
         recent_hits = pd.DataFrame()
     else:
         try:
